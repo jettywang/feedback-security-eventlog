@@ -275,6 +275,45 @@ class Template:
     def add_child_template(self, tpl: Template) -> None:
         self.child_templates.append(tpl)
 
+    def create_instance(self) -> Template:
+        """Create an independent instance of this template.
+
+        A template as read from a template definition is immutable: it only contains the element tree with
+        substitution placeholders and the mapping from names to substitution IDs. Every time the template is
+        instantiated, the substitution values have to be bound to fresh placeholders so that values from one
+        record can never leak into (or overwrite) values from another record.
+        """
+        instance = Template()
+        # Keep every substitution ID known to the definition, then let the placeholders found in the
+        # element tree replace them (the last placeholder for an ID wins, just like ``add_sub``).
+        instance.subs = {sub_id: BxmlSub(sub_id) for sub_id in self.subs}
+        instance.element = self._clone_element(self.element, instance)
+        instance.mapping = dict(self.mapping)
+        return instance
+
+    def _clone_element(self, tag: BxmlTag, instance: Template) -> BxmlTag:
+        clone = BxmlTag(tag.name)
+
+        for key, value in tag.attributes.items():
+            if isinstance(value, BxmlSub):
+                value = self._clone_sub(value, instance)
+            clone.attributes[key] = value
+
+        for child in tag.children:
+            if isinstance(child, BxmlTag):
+                child = self._clone_element(child, instance)
+            elif isinstance(child, BxmlSub):
+                child = self._clone_sub(child, instance)
+            clone.children.append(child)
+
+        return clone
+
+    def _clone_sub(self, sub: BxmlSub, instance: Template) -> BxmlSub:
+        clone = BxmlSub(sub.sub_id)
+        # Mirror ``add_sub`` semantics: the last placeholder for a substitution ID wins.
+        instance.subs[sub.sub_id] = clone
+        return clone
+
 
 class Bxml:
     """An object that keeps track of the BXML streams."""
@@ -443,6 +482,10 @@ class Bxml:
 
     def read_template_instance(self) -> Template:
         _template = self._read_template_reference_and_data()
+        # A template definition is shared between every record that references it, so all substitution
+        # values and nested templates of this record must be bound to a fresh instance of the definition.
+        # Otherwise a later record would overwrite the values of events that were already returned.
+        instance = _template.create_instance()
 
         descriptors = list(BxmlTemplateDescriptor.read_descriptors_from_stream(self.bxml_stream))
 
@@ -450,12 +493,12 @@ class Bxml:
             value = _read_descriptor_value(self, descriptor)
 
             if isinstance(value, Template):
-                _template.add_child_template(value)
+                instance.add_child_template(value)
 
-            if index in _template.subs:
-                _template.subs[index].set(value)
+            if index in instance.subs:
+                instance.subs[index].set(value)
 
-        return _template
+        return instance
 
 
 class BxmlNameReader:
