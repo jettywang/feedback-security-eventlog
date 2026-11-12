@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 from dissect.util.ts import wintimestamp
 
 from dissect.eventlog.bxml.c_bxml import c_bxml
-from dissect.eventlog.exceptions import BxmlException
+from dissect.eventlog.exceptions import BxmlException, ResourceLimitExceeded
+from dissect.eventlog.limits import BoundedStream, DepthGuard, ResourceLimit
 from dissect.eventlog.utils import KeyValueCollection
 
 if TYPE_CHECKING:
@@ -237,23 +238,35 @@ class Template:
 
         return result_dict
 
-    def as_full_map(self) -> KeyValueCollection:
-        key_value_pair = KeyValueCollection()
-        self._get_map_recursive(self.element, [], key_value_pair)
+    def as_full_map(
+        self, max_fields: int | None = None, depth_guard: DepthGuard | None = None
+    ) -> KeyValueCollection:
+        key_value_pair = KeyValueCollection(max_fields)
+        self._get_map_recursive(self.element, [], key_value_pair, depth_guard)
         return key_value_pair
 
     def _get_map_recursive(
-        self, obj: Template | BxmlSub | BxmlTag | Any, path: list[BxmlTag | Any], collection: KeyValueCollection
+        self,
+        obj: Template | BxmlSub | BxmlTag | Any,
+        path: list[BxmlTag | Any],
+        collection: KeyValueCollection,
+        depth_guard: DepthGuard | None = None,
     ) -> None:
         if isinstance(obj, Template):
-            self._get_map_recursive(obj.element, path, collection)
+            # A back-referenced (cached and possibly cyclic) template is only traversed here, during
+            # map expansion, so the depth guard must cover this path as well.
+            if depth_guard is not None:
+                with depth_guard:
+                    self._get_map_recursive(obj.element, path, collection, depth_guard)
+            else:
+                self._get_map_recursive(obj.element, path, collection, depth_guard)
 
         elif isinstance(obj, BxmlSub):
-            self._get_map_recursive(obj.get(), path, collection)
+            self._get_map_recursive(obj.get(), path, collection, depth_guard)
 
         elif isinstance(obj, BxmlTag):
             for child in obj.children:
-                self._get_map_recursive(child, [*path, obj], collection)
+                self._get_map_recursive(child, [*path, obj], collection, depth_guard)
 
             if obj.name == "Event":
                 return
@@ -279,12 +292,37 @@ class Template:
 class Bxml:
     """An object that keeps track of the BXML streams."""
 
-    def __init__(self, bxml_stream: BytesIO, elf_chunk_stream: BytesIO) -> None:
-        self.bxml_stream = bxml_stream
+    def __init__(
+        self, bxml_stream: BytesIO | bytes, elf_chunk_stream: BytesIO, limits: ResourceLimit | None = None
+    ) -> None:
+        self.limits = limits or ResourceLimit()
+        if isinstance(bxml_stream, bytes | bytearray):
+            bxml_stream = BytesIO(bxml_stream)
+        self.bxml_stream = BoundedStream(bxml_stream, self.limits.max_bytes)
         self.elf_chunk_stream = elf_chunk_stream
         self.data_offset: int = None
         self.template: Template = None
         self.templates: dict[int, Template] = None
+        self.depth_guard = DepthGuard(self.limits.max_template_depth)
+        self.substitution_count = 0
+
+    @property
+    def bytes_read(self) -> int:
+        """Total bytes consumed from the bounded BinXML stream."""
+        return self.bxml_stream.bytes_read
+
+    def account_substitutions(self, count: int) -> None:
+        """Validate a descriptor entry count against the substitution budget.
+
+        The count is a 32-bit value taken directly from untrusted input, so it is checked before
+        the descriptor loop runs rather than after.
+        """
+        if self.substitution_count + count > self.limits.max_substitutions:
+            raise ResourceLimitExceeded(
+                f"BinXML substitution limit of {self.limits.max_substitutions} exceeded; "
+                f"requested {count} more after {self.substitution_count}"
+            )
+        self.substitution_count += count
 
     @property
     def current_offset(self) -> int:
@@ -442,18 +480,22 @@ class Bxml:
         return f"&x{c_bxml.uint16(self.bxml_stream):x};"
 
     def read_template_instance(self) -> Template:
-        _template = self._read_template_reference_and_data()
+        # Every template instance (including one reached through a nested BinXML substitution or a
+        # back-reference to a cached definition) passes through here. The guard therefore bounds
+        # both deeply nested templates and cyclic template references with a single counter.
+        with self.depth_guard:
+            _template = self._read_template_reference_and_data()
 
-        descriptors = list(BxmlTemplateDescriptor.read_descriptors_from_stream(self.bxml_stream))
+            descriptors = list(BxmlTemplateDescriptor.read_descriptors_from_stream(self))
 
-        for index, descriptor in enumerate(descriptors):
-            value = _read_descriptor_value(self, descriptor)
+            for index, descriptor in enumerate(descriptors):
+                value = _read_descriptor_value(self, descriptor)
 
-            if isinstance(value, Template):
-                _template.add_child_template(value)
+                if isinstance(value, Template):
+                    _template.add_child_template(value)
 
-            if index in _template.subs:
-                _template.subs[index].set(value)
+                if index in _template.subs:
+                    _template.subs[index].set(value)
 
         return _template
 
@@ -554,13 +596,13 @@ def parse_bxml(bxml: Bxml) -> KeyValueCollection:
             continue
 
         if isinstance(token, BxmlTag):
-            key_collection = KeyValueCollection()
-            Template()._get_map_recursive(token, [], key_collection)
+            key_collection = KeyValueCollection(bxml.limits.max_fields)
+            Template()._get_map_recursive(token, [], key_collection, bxml.depth_guard)
             return key_collection
         if bxml.read_token() != BxmlToken.BXML_END:
             pass
 
-        return token.as_full_map()
+        return token.as_full_map(bxml.limits.max_fields, bxml.depth_guard)
 
 
 class BxmlTemplateDescriptor:
@@ -583,9 +625,16 @@ class BxmlTemplateDescriptor:
         return TYPE_READERS[self.type_id]
 
     @classmethod
-    def read_descriptors_from_stream(cls, stream: BytesIO) -> Iterator[Self]:
-        """Read a range of BXML descriptors from stream."""
+    def read_descriptors_from_stream(cls, bxml: Bxml) -> Iterator[Self]:
+        """Read a range of BXML descriptors from stream.
+
+        The entry count originates from untrusted input and is validated against the parser's
+        substitution budget before any descriptor is materialised, so a forged multi-billion
+        count cannot drive an unbounded loop.
+        """
+        stream = bxml.bxml_stream
         entry_count = c_bxml.uint32(stream)
+        bxml.account_substitutions(entry_count)
         for _ in range(entry_count):
             yield cls.from_stream(stream)
 

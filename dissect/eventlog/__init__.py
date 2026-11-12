@@ -6,8 +6,10 @@ from dissect.eventlog.exceptions import (
     BxmlException,
     Error,
     MalformedElfChnkException,
+    ResourceLimitExceeded,
     UnknownSignatureException,
 )
+from dissect.eventlog.limits import ResourceLimit
 from dissect.eventlog.wevt.wevt import CRIM
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "Evt",
     "Evtx",
     "MalformedElfChnkException",
+    "ResourceLimit",
+    "ResourceLimitExceeded",
     "UnknownSignatureException",
 ]
