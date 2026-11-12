@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
+    from dissect.eventlog.bxml.structured import StructuredEvent
+
 
 class BxmlToken(IntEnum):
     BXML_END = 0x00
@@ -168,10 +170,36 @@ class BxmlTag:
         self.attributes.update(attribute)
 
 
+class CorruptValue:
+    """A descriptor value that could not be parsed.
+
+    The original (raw) bytes and the reason why parsing failed are retained so that forensic
+    output never silently drops a field. It renders as the legacy ``<CORRUPT DATA>`` marker.
+    """
+
+    def __init__(self, raw: bytes, reason: str):
+        self.raw = raw
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return "<CORRUPT DATA>"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(raw={self.raw!r}, reason={self.reason!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CorruptValue) and self.raw == other.raw and self.reason == other.reason
+
+
 class BxmlSub:
-    def __init__(self, sub_id: int):
+    def __init__(self, sub_id: int, value_type: BxmlType | None = None, is_array: bool = False):
         self.sub_id = sub_id
         self.value = None
+        # Metadata as declared in the BXML substitution token / template descriptor.
+        self.value_type = value_type
+        self.is_array = is_array
+        # Whether a template descriptor actually supplied a value for this substitution.
+        self.assigned = False
 
     def __repr__(self):
         return self.__str__()
@@ -179,8 +207,12 @@ class BxmlSub:
     def __str__(self):
         return str(self.value)
 
-    def set(self, value: Any) -> None:
+    def set(self, value: Any, descriptor: BxmlTemplateDescriptor | None = None) -> None:
         self.value = value
+        self.assigned = True
+        if descriptor is not None:
+            self.value_type = descriptor.type_id
+            self.is_array = descriptor.is_array
 
     def get(self) -> Any:
         return self.value
@@ -430,7 +462,9 @@ class Bxml:
 
     def substitute_token_and_add_to_template(self, template: Template) -> BxmlSub:
         substitution = c_bxml.BXML_OPTIONAL_SUBSTITUTION(self.bxml_stream)
-        bxml_sub = BxmlSub(substitution.sub_id)
+        type_id = substitution.value_type & BxmlTemplateDescriptor.DESCRIPTOR_MASK
+        is_array = (substitution.value_type & BxmlTemplateDescriptor.ARRAY_MASK) == BxmlTemplateDescriptor.ARRAY_MASK
+        bxml_sub = BxmlSub(substitution.sub_id, BxmlType(type_id), is_array)
         template.add_sub(substitution.sub_id, bxml_sub)
         return bxml_sub
 
@@ -447,13 +481,13 @@ class Bxml:
         descriptors = list(BxmlTemplateDescriptor.read_descriptors_from_stream(self.bxml_stream))
 
         for index, descriptor in enumerate(descriptors):
-            value = _read_descriptor_value(self, descriptor)
+            value = read_descriptor_value(self, descriptor)
 
             if isinstance(value, Template):
                 _template.add_child_template(value)
 
             if index in _template.subs:
-                _template.subs[index].set(value)
+                _template.subs[index].set(value, descriptor)
 
         return _template
 
@@ -544,7 +578,7 @@ class Token:
         return False
 
 
-def parse_bxml(bxml: Bxml) -> KeyValueCollection:
+def parse_bxml(bxml: Bxml, structured: bool = False) -> KeyValueCollection | StructuredEvent:
     while True:
         token = bxml.read_token(bxml.template)
         if token == BxmlToken.BXML_END:
@@ -554,11 +588,21 @@ def parse_bxml(bxml: Bxml) -> KeyValueCollection:
             continue
 
         if isinstance(token, BxmlTag):
+            if structured:
+                from dissect.eventlog.bxml.structured import structurize
+
+                return structurize(token)
+
             key_collection = KeyValueCollection()
             Template()._get_map_recursive(token, [], key_collection)
             return key_collection
         if bxml.read_token() != BxmlToken.BXML_END:
             pass
+
+        if structured:
+            from dissect.eventlog.bxml.structured import structurize
+
+            return structurize(token)
 
         return token.as_full_map()
 
@@ -596,15 +640,43 @@ class BxmlTemplateDescriptor:
         return cls(struct)
 
 
-def _read_descriptor_value(bxml: Bxml, descriptor: BxmlTemplateDescriptor) -> Any:
+def read_descriptor_value(bxml: Bxml, descriptor: BxmlTemplateDescriptor) -> Any:
+    """Read the value described by ``descriptor`` from the BXML stream.
+
+    Each descriptor owns exactly ``descriptor.size`` bytes, so failures are contained: a corrupt
+    descriptor never leaves the stream positioned inside its own data, which would make the next
+    field borrow the previous field's value or type. Unparseable data is returned as a
+    :class:`CorruptValue` together with the original bytes and the failure reason.
+    """
+    if descriptor.type_id == BxmlType.BINXML:
+        # Nested BXML owns its own length and positions the stream itself.
+        try:
+            return read_value(bxml, descriptor, None)
+        except (BxmlException, EOFError) as error:
+            bxml.bxml_stream.seek(bxml.bxml_stream.tell() + descriptor.size)
+            return CorruptValue(b"", str(error))
+
+    raw = b""
+    start = bxml.bxml_stream.tell()
     try:
-        value = read_value(bxml, descriptor, None)
-    except BxmlException:
-        value = "<CORRUPT DATA>"
+        raw = bxml.bxml_stream.read(descriptor.size)
+        return read_value(bxml, descriptor, None, data=raw)
+    except (BxmlException, EOFError, UnicodeDecodeError) as error:
+        # Anchor on the declared size so the next descriptor never reads our leftover bytes.
+        bxml.bxml_stream.seek(start + descriptor.size)
+        return CorruptValue(raw, str(error))
+
+
+def _read_descriptor_value(bxml: Bxml, descriptor: BxmlTemplateDescriptor) -> Any:
+    value = read_descriptor_value(bxml, descriptor)
+    if isinstance(value, CorruptValue):
+        return str(value)
     return value
 
 
-def read_value(binxml: Bxml, descriptor: BxmlTemplateDescriptor, template: Template) -> Any:
+def read_value(
+    binxml: Bxml, descriptor: BxmlTemplateDescriptor, template: Template, data: bytes | None = None
+) -> Any:
     """Read a value from a bxml node.
 
     0x00 NullType NULL or empty
@@ -634,7 +706,8 @@ def read_value(binxml: Bxml, descriptor: BxmlTemplateDescriptor, template: Templ
     0x23 EvtXml
     """
     if descriptor.has_type_reader:
-        data = binxml.bxml_stream.read(descriptor.size)
+        if data is None:
+            data = binxml.bxml_stream.read(descriptor.size)
         stream = BytesIO(data)
 
         if descriptor.is_array:

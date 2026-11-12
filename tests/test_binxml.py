@@ -6,7 +6,13 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from dissect.eventlog.bxml import Bxml, BxmlToken
+from dissect.eventlog.bxml import Bxml, BxmlToken, BxmlType
+from dissect.eventlog.bxml.bxml import (
+    BxmlTemplateDescriptor,
+    CorruptValue,
+    read_descriptor_value,
+)
+from dissect.eventlog.bxml.c_bxml import c_bxml
 from dissect.eventlog.exceptions import BxmlException
 
 if TYPE_CHECKING:
@@ -144,3 +150,78 @@ def test_parse_entity_more() -> None:
         patch.object(Bxml, Bxml.read_token.__name__, return_value=" World"),
     ):
         assert Bxml(None, None).read_entity_reference(True, Mock()) == "&Hello; World"
+
+
+def _descriptor(type_id: int, size: int) -> BxmlTemplateDescriptor:
+    return BxmlTemplateDescriptor(c_bxml.BXML_TEMPLATE_VALUE_DESC(size=size, type_id=type_id, a=0))
+
+
+def test_read_descriptor_value_scalar_and_array() -> None:
+    bxml = Bxml(BytesIO(b""), None)
+    bxml.bxml_stream = BytesIO((7).to_bytes(4, "little") + (8).to_bytes(4, "little"))
+
+    first = read_descriptor_value(bxml, _descriptor(BxmlType.UINT32, 4))
+    second = read_descriptor_value(bxml, _descriptor(BxmlType.UINT32, 4))
+
+    assert first == 7
+    assert second == 8
+    assert bxml.bxml_stream.tell() == 8
+
+
+def test_read_descriptor_value_empty_array_preserved() -> None:
+    bxml = Bxml(BytesIO(b""), None)
+    bxml.bxml_stream = BytesIO(b"")
+
+    descriptor = _descriptor(BxmlType.UINT32 | BxmlTemplateDescriptor.ARRAY_MASK, 0)
+    assert read_descriptor_value(bxml, descriptor) == []
+    assert descriptor.is_array is True
+
+
+def test_read_descriptor_value_unsupported_type_keeps_raw_and_reason() -> None:
+    payload = b"\x99\x88\x77"
+    bxml = Bxml(BytesIO(b""), None)
+    bxml.bxml_stream = BytesIO(payload + (5).to_bytes(4, "little"))
+
+    corrupt = read_descriptor_value(bxml, _descriptor(0x19, len(payload)))
+    following = read_descriptor_value(bxml, _descriptor(BxmlType.UINT32, 4))
+
+    assert isinstance(corrupt, CorruptValue)
+    assert corrupt.raw == payload
+    assert "Unknown value type" in corrupt.reason
+    # The next descriptor must not borrow the corrupt field's bytes or type.
+    assert following == 5
+    assert bxml.bxml_stream.tell() == len(payload) + 4
+
+
+def test_read_descriptor_value_truncated_data_does_not_shift_next_field() -> None:
+    # Real BXML streams are arbitrary file-like objects, not BytesIO: a short read raises EOFError.
+    source = Mock()
+    source.tell.side_effect = [0, 8, 12]
+    source.read.side_effect = [
+        b"\x01\x02",  # Descriptor claims 8 bytes, only 2 available
+        (9).to_bytes(4, "little"),  # Next, intact descriptor
+    ]
+    source.seek.return_value = None
+
+    bxml = Bxml(BytesIO(b""), None)
+    bxml.bxml_stream = source
+
+    corrupt = read_descriptor_value(bxml, _descriptor(BxmlType.UINT64, 8))
+    following = read_descriptor_value(bxml, _descriptor(BxmlType.UINT32, 4))
+
+    assert isinstance(corrupt, CorruptValue)
+    assert corrupt.raw == b"\x01\x02"
+    assert isinstance(corrupt.reason, str) and corrupt.reason
+    # The declared size, not the consumed byte count, anchors the next descriptor.
+    source.seek.assert_called_with(8)
+    assert following == 9
+    assert source.read.call_count == 2
+
+
+def test_read_descriptor_value_legacy_marker_rendering() -> None:
+    bxml = Bxml(BytesIO(b""), None)
+    bxml.bxml_stream = BytesIO(b"\x00")
+
+    from dissect.eventlog.bxml.bxml import _read_descriptor_value
+
+    assert _read_descriptor_value(bxml, _descriptor(0x19, 1)) == "<CORRUPT DATA>"

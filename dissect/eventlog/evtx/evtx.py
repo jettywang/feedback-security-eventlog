@@ -7,7 +7,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, BinaryIO
 
-from dissect.eventlog.bxml import Bxml, BxmlSub, EvtxNameReader, parse_bxml
+from dissect.eventlog.bxml import Bxml, BxmlSub, EvtxNameReader, FieldState, parse_bxml
 from dissect.eventlog.evtx.c_evtx import c_evtx
 from dissect.eventlog.exceptions import MalformedElfChnkException
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from dissect.eventlog.bxml.structured import StructuredEvent
     from dissect.eventlog.utils import KeyValueCollection
 
 log = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ class ElfChnk:
         self.templates = {}
         self.data_offset = 0
 
-    def read(self, records: bool = True) -> Iterator[KeyValueCollection]:
+    def read(self, records: bool = True, structured: bool = False) -> Iterator[KeyValueCollection | StructuredEvent]:
         try:
             while True:
                 offset = self.stream.tell()
@@ -63,10 +64,20 @@ class ElfChnk:
                 bxml.templates = self.templates
                 bxml.template = None
                 bxml.set_name_reader(EvtxNameReader(bxml))
-                rec = parse_bxml(bxml)
+                rec = parse_bxml(bxml, structured=structured)
 
+                if structured:
+                    timestamp_fields = rec.get_all("SystemTime")
+                    timestamp_values = [
+                        field.value
+                        for field in timestamp_fields
+                        if field.state in (FieldState.SCALAR, FieldState.ARRAY)
+                    ]
+                    if not timestamp_values or any(value is None for value in timestamp_values):
+                        log.warning("Missing timestamp in record")
+                        continue
                 # Validate record
-                if (
+                elif (
                     "TimeCreated_SystemTime" not in rec
                     or (
                         isinstance(rec["TimeCreated_SystemTime"], BxmlSub)
@@ -94,6 +105,13 @@ class Evtx:
         self.count = 0
 
     def __iter__(self) -> Iterator[KeyValueCollection]:
+        yield from self._read_chunks(structured=False)
+
+    def structured_events(self) -> Iterator[StructuredEvent]:
+        """Yield records as :class:`StructuredEvent` objects with types and order preserved."""
+        yield from self._read_chunks(structured=True)
+
+    def _read_chunks(self, structured: bool) -> Iterator[KeyValueCollection | StructuredEvent]:
         chunk_offset = self.header.header_block_size
 
         skip = self.header.header_block_size - len(c_evtx.EVTX_HEADER)
@@ -107,7 +125,7 @@ class Evtx:
 
             try:
                 c = ElfChnk(chunk, self.path)
-                for r in c.read():
+                for r in c.read(structured=structured):
                     yield r
                     self.count += 1
             except MalformedElfChnkException:
