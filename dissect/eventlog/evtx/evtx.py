@@ -8,6 +8,7 @@ import os
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.eventlog.bxml import Bxml, BxmlSub, EvtxNameReader, parse_bxml
+from dissect.eventlog.evtx import recovery
 from dissect.eventlog.evtx.c_evtx import c_evtx
 from dissect.eventlog.exceptions import MalformedElfChnkException
 
@@ -83,6 +84,18 @@ class ElfChnk:
                 log.exception("Exception when processing chunk")
                 raise MalformedElfChnkException
 
+    def recover(self, chunk_offset: int = 0) -> recovery.ChunkRecovery:
+        """Recover records from this chunk without changing the evidence bytes.
+
+        This is the opt-in recovery path for damaged chunks.  Normal iteration keeps its strict behavior and
+        :class:`MalformedElfChnkException` contract.
+        """
+        self.stream.seek(0)
+        return recovery.recover_chunk(
+            self.stream.read(),
+            chunk_offset=chunk_offset,
+        )
+
 
 class Evtx:
     """Microsoft Event logs."""
@@ -114,3 +127,15 @@ class Evtx:
                 continue
 
             chunk_offset += 0x10000
+
+    def recover(self) -> recovery.RecoveryReport:
+        """Recover structurally valid records from damaged chunks.
+
+        Explicit opt-in recovery mode.  Strict iteration through ``iter(evtx)`` is unchanged; this method reads the
+        source from the start (seekable streams only) and never writes to it.  The returned report contains the
+        recovered records, their original file offsets, skipped byte ranges and the confidence evidence for each
+        accepted record.
+        """
+        report = recovery.recover_evtx(self.fh, path=self.path)
+        self.count = len(report.records)
+        return report
