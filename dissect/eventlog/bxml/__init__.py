@@ -4,6 +4,7 @@ from dissect.eventlog.bxml.bxml import (
     Bxml,
     BxmlNameReader,
     BxmlSub,
+    BxmlTag,
     BxmlToken,
     BxmlType,
     EvtxNameReader,
@@ -11,14 +12,20 @@ from dissect.eventlog.bxml.bxml import (
     WevtNameReader,
     parse_bxml,
 )
+from dissect.eventlog.utils import ByteRange, FieldSource, SourceCollection, SourceKind
 
 __all__ = (
     "Bxml",
     "BxmlNameReader",
     "BxmlSub",
+    "BxmlTag",
     "BxmlToken",
     "BxmlType",
+    "ByteRange",
     "EvtxNameReader",
+    "FieldSource",
+    "SourceCollection",
+    "SourceKind",
     "Template",
     "WevtNameReader",
     "parse_bxml",

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, BinaryIO
 from dissect.eventlog.bxml import Bxml, BxmlSub, EvtxNameReader, parse_bxml
 from dissect.eventlog.evtx.c_evtx import c_evtx
 from dissect.eventlog.exceptions import MalformedElfChnkException
+from dissect.eventlog.utils import attach_sources
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -22,10 +23,14 @@ log.setLevel(os.getenv("DISSECT_LOG_EVTX", "CRITICAL"))
 
 
 class ElfChnk:
-    def __init__(self, d: bytes, path: Path | None = None):
+    def __init__(self, d: bytes, path: Path | None = None, offset: int | None = None):
         self.path = path
         self.stream = io.BytesIO(d)
         self.header = c_evtx.EVTX_CHUNK(self.stream)
+        # Absolute file offset of this chunk. ``None`` means the caller only supplied raw
+        # chunk bytes; provenance ranges are then reported as chunk-relative and carry no
+        # absolute file position.
+        self.offset = offset
 
         if self.header.magic != b"ElfChnk\x00":
             if self.header.magic != b"\x00\x00\x00\x00\x00\x00\x00\x00":
@@ -39,7 +44,7 @@ class ElfChnk:
         self.templates = {}
         self.data_offset = 0
 
-    def read(self, records: bool = True) -> Iterator[KeyValueCollection]:
+    def read(self, records: bool = True, with_sources: bool = False) -> Iterator[KeyValueCollection]:
         try:
             while True:
                 offset = self.stream.tell()
@@ -62,8 +67,20 @@ class ElfChnk:
                 bxml.data_offset = self.data_offset
                 bxml.templates = self.templates
                 bxml.template = None
+                bxml.with_sources = with_sources
+                bxml.chunk_offset = self.offset or 0
+                bxml.record_offset = (self.offset or 0) + offset
+                bxml.absolute = self.offset is not None
                 bxml.set_name_reader(EvtxNameReader(bxml))
-                rec = parse_bxml(bxml)
+                rec = parse_bxml(bxml, with_sources=with_sources)
+
+                if with_sources:
+                    rec, sources = rec
+                    sources.record_offset = bxml.record_offset
+                    sources.record_id = r.record_id
+                    sources.chunk_offset = self.offset if self.offset is not None else 0
+                    sources.absolute = self.offset is not None
+                    attach_sources(rec, sources)
 
                 # Validate record
                 if (
@@ -87,13 +104,27 @@ class ElfChnk:
 class Evtx:
     """Microsoft Event logs."""
 
-    def __init__(self, fh: BinaryIO, path: Path | None = None):
+    def __init__(self, fh: BinaryIO, path: Path | None = None, include_sources: bool = False):
         self.path = path
         self.fh = fh
         self.header = c_evtx.EVTX_HEADER(self.fh)
         self.count = 0
+        # Opt-in constructor flag; plain iteration stays provenance-free by default.
+        self.include_sources = include_sources
 
     def __iter__(self) -> Iterator[KeyValueCollection]:
+        yield from self._read_chunks(with_sources=self.include_sources)
+
+    def with_sources(self) -> Iterator[KeyValueCollection]:
+        """Iterate records with an attached ``sources`` :class:`SourceCollection`.
+
+        The record values, keys and ordering are identical to :meth:`__iter__`; each yielded
+        record additionally carries ``record.sources`` keyed by the exact output key. No
+        provenance is collected when using plain iteration.
+        """
+        yield from self._read_chunks(with_sources=True)
+
+    def _read_chunks(self, with_sources: bool) -> Iterator[KeyValueCollection]:
         chunk_offset = self.header.header_block_size
 
         skip = self.header.header_block_size - len(c_evtx.EVTX_HEADER)
@@ -106,8 +137,8 @@ class Evtx:
                 break
 
             try:
-                c = ElfChnk(chunk, self.path)
-                for r in c.read():
+                c = ElfChnk(chunk, self.path, offset=chunk_offset)
+                for r in c.read(with_sources=with_sources):
                     yield r
                     self.count += 1
             except MalformedElfChnkException:

@@ -8,14 +8,19 @@ from dissect.eventlog.exceptions import (
     MalformedElfChnkException,
     UnknownSignatureException,
 )
+from dissect.eventlog.utils import ByteRange, FieldSource, SourceCollection, SourceKind
 from dissect.eventlog.wevt.wevt import CRIM
 
 __all__ = [
     "CRIM",
     "BxmlException",
+    "ByteRange",
     "Error",
     "Evt",
     "Evtx",
+    "FieldSource",
     "MalformedElfChnkException",
+    "SourceCollection",
+    "SourceKind",
     "UnknownSignatureException",
 ]

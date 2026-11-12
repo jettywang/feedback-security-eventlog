@@ -19,6 +19,34 @@ pip install dissect.eventlog
 
 This module is also automatically installed if you install the `dissect` package.
 
+## Field provenance
+
+Plain iteration returns the familiar `KeyValueCollection`. To trace a field back to the
+bytes that produced it, opt in to sources:
+
+```python
+from dissect.eventlog.evtx import Evtx
+from dissect.eventlog.utils import ByteRange, SourceKind
+
+with path.open("rb") as fh:
+    for record in Evtx(fh).with_sources():
+        # Keys are identical to the default output, including duplicate suffixes.
+        source = record.sources["EventID"]
+        for byte_range in source.ranges:
+            if byte_range.is_resolved:
+                print(byte_range.kind, hex(byte_range.start), byte_range.read(fh))
+```
+
+Every output key receives a `FieldSource` with the complete ordered list of ranges that
+contributed to the value: the substitution token, the record's descriptor and value bytes,
+the element/attribute name table entry, and the chunk template definition (including lexically
+containing templates for nested templates). `SourceKind.RECORD` marks bytes in the current
+record, while `SourceKind.TEMPLATE` and `SourceKind.NAME` mark bytes reused from the chunk.
+Ranges are never merged, so same-named fields and multi-byte values keep every evidence
+interval. If a boundary cannot be determined exactly, the range is reported as
+`SourceKind.UNRESOLVED` with a reason and has no guessed offset.
+
+
 ## Build and test instructions
 
 This project uses `tox` to build source and wheel distributions. Run the following command from the root folder to build
